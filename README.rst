@@ -30,7 +30,7 @@ backwards compatibility, you have to replace 'bitcoinrpc' with 'jsonrpc' in setu
 
 Or simply install the library using pip::
 
-    pip install python-bitcoinrpc
+    python -m pip install git+https://github.com/TheHolyRoger/python-bitcoinrpc.git
 
 Example
 =======
@@ -40,13 +40,13 @@ Example
 
     # rpc_user and rpc_password are set in the bitcoin.conf file
     rpc_connection = AuthServiceProxy("http://%s:%s@127.0.0.1:8332"%(rpc_user, rpc_password))
-    best_block_hash = rpc_connection.getbestblockhash()
-    print(rpc_connection.getblock(best_block_hash))
+    best_block_hash = await rpc_connection.getbestblockhash()
+    print(await rpc_connection.getblock(best_block_hash))
 
     # batch support : print timestamps of blocks 0 to 99 in 2 RPC round-trips:
     commands = [ [ "getblockhash", height] for height in range(100) ]
-    block_hashes = rpc_connection.batch_(commands)
-    blocks = rpc_connection.batch_([ [ "getblock", h ] for h in block_hashes ])
+    block_hashes = await rpc_connection.batch_(commands)
+    blocks = await rpc_connection.batch_([ [ "getblock", h ] for h in block_hashes ])
     block_times = [ block["time"] for block in blocks ]
     print(block_times)
 
@@ -61,7 +61,7 @@ Logging all RPC calls to stderr
     logging.getLogger("BitcoinRPC").setLevel(logging.DEBUG)
 
     rpc_connection = AuthServiceProxy("http://%s:%s@127.0.0.1:8332"%(rpc_user, rpc_password))
-    print(rpc_connection.getinfo())
+    print(await rpc_connection.getinfo())
 
 Produces output on stderr like
 

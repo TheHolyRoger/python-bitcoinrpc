@@ -34,10 +34,8 @@
   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 """
 
-try:
-    import http.client as httplib
-except ImportError:
-    import httplib
+import aiohttp
+from asyncio import wait_for
 import base64
 import decimal
 import json
@@ -77,14 +75,25 @@ def EncodeDecimal(o):
         return float(round(o, 8))
     raise TypeError(repr(o) + " is not JSON serializable")
 
+
+class JsonWrapper(object):
+    def __call__(self, *args, **kwargs):
+        return json.loads(*args, **kwargs, parse_float=decimal.Decimal)
+
 class AuthServiceProxy(object):
     __id_count = 0
 
-    def __init__(self, service_url, service_name=None, timeout=HTTP_TIMEOUT, 
-                 connection=None, ssl_context=None):
+    def __init__(self,
+                 service_url,
+                 service_name=None,
+                 timeout=HTTP_TIMEOUT, 
+                 connection: aiohttp.ClientSession=None,
+                 ssl_context=None):
         self.__service_url = service_url
         self.__service_name = service_name
         self.__url = urlparse.urlparse(service_url)
+        self.__aiohttp_client_session = connection
+        self.__aiohttp_must_close = False
         if self.__url.port is None:
             port = 80
         else:
@@ -103,25 +112,16 @@ class AuthServiceProxy(object):
 
         self.__timeout = timeout
 
-        if connection:
-            # Callables re-use the connection of the original proxy
-            self.__conn = connection
-        elif self.__url.scheme == 'https':
-            self.__conn = httplib.HTTPSConnection(self.__url.hostname, port,
-                                                  timeout=timeout, context=ssl_context)
-        else:
-            self.__conn = httplib.HTTPConnection(self.__url.hostname, port,
-                                                 timeout=timeout)
-
     def __getattr__(self, name):
         if name.startswith('__') and name.endswith('__'):
             # Python internal stuff
             raise AttributeError
         if self.__service_name is not None:
             name = "%s.%s" % (self.__service_name, name)
-        return AuthServiceProxy(self.__service_url, name, self.__timeout, self.__conn)
+        return AuthServiceProxy(self.__service_url, name, self.__timeout, self.__aiohttp_client_session)
+    
 
-    def __call__(self, *args):
+    async def __call__(self, *args):
         AuthServiceProxy.__id_count += 1
 
         log.debug("-%s-> %s %s"%(AuthServiceProxy.__id_count, self.__service_name,
@@ -130,14 +130,17 @@ class AuthServiceProxy(object):
                                'method': self.__service_name,
                                'params': args,
                                'id': AuthServiceProxy.__id_count}, default=EncodeDecimal)
-        self.__conn.request('POST', self.__url.path, postdata,
-                            {'Host': self.__url.hostname,
-                             'User-Agent': USER_AGENT,
-                             'Authorization': self.__auth_header,
-                             'Content-type': 'application/json'})
-        self.__conn.sock.settimeout(self.__timeout)
+        request_headers = {"Host": self.__url.hostname,
+                           "User-Agent": USER_AGENT,
+                           "Content-type": "application/json"}
+        resp = await wait_for(self._get_shared_client().request(method="POST",
+                                                                url=self.__url.geturl(),
+                                                                data=postdata,
+                                                                headers=request_headers), self.__timeout)
 
-        response = self._get_response()
+        response = await self._get_response(resp)
+        if self.__aiohttp_must_close:
+            await self._get_shared_client().close()
         if response.get('error') is not None:
             raise JSONRPCException(response['error'])
         elif 'result' not in response:
@@ -146,7 +149,13 @@ class AuthServiceProxy(object):
         
         return response['result']
 
-    def batch_(self, rpc_calls):
+    def _get_shared_client(self) -> aiohttp.ClientSession:
+        if not self.__aiohttp_client_session:
+            self.__aiohttp_client_session = aiohttp.ClientSession()
+            self.__aiohttp_must_close = True
+        return self.__aiohttp_client_session
+
+    async def batch_(self, rpc_calls):
         """Batch RPC call.
            Pass array of arrays: [ [ "method", params... ], ... ]
            Returns array of results.
@@ -159,13 +168,16 @@ class AuthServiceProxy(object):
 
         postdata = json.dumps(batch_data, default=EncodeDecimal)
         log.debug("--> "+postdata)
-        self.__conn.request('POST', self.__url.path, postdata,
-                            {'Host': self.__url.hostname,
-                             'User-Agent': USER_AGENT,
-                             'Authorization': self.__auth_header,
-                             'Content-type': 'application/json'})
+        request_headers = {"Host": self.__url.hostname,
+                           "User-Agent": USER_AGENT,
+                           "Authorization": self.__auth_header,
+                           "Content-type": "application/json"}
+        resp = await self._get_shared_client().request(method="POST",
+                                                       url=self.__url.geturl(),
+                                                       data=postdata,
+                                                       headers=request_headers)
         results = []
-        responses = self._get_response()
+        responses = await self._get_response(resp)
         if isinstance(responses, (dict,)):
             if ('error' in responses) and (responses['error'] is not None):
                 raise JSONRPCException(responses['error'])
@@ -181,21 +193,24 @@ class AuthServiceProxy(object):
                 results.append(response['result'])
         return results
 
-    def _get_response(self):
-        http_response = self.__conn.getresponse()
-        if http_response is None:
+    async def _get_response(self, resp):
+        try:
+            json_response = await resp.json(loads=JsonWrapper())
+        except:
+            json_response = None
+        if self.__aiohttp_must_close:
+            await self._get_shared_client().close()
+        if json_response is None:
             raise JSONRPCException({
                 'code': -342, 'message': 'missing HTTP response from server'})
 
-        content_type = http_response.getheader('Content-Type')
+        content_type = resp.headers.get('Content-Type')
         if content_type != 'application/json':
             raise JSONRPCException({
-                'code': -342, 'message': 'non-JSON HTTP response with \'%i %s\' from server' % (http_response.status, http_response.reason)})
+                'code': -342, 'message': 'non-JSON HTTP response with \'%i %s\' from server' % (resp.status, resp.reason)})
 
-        responsedata = http_response.read().decode('utf8')
-        response = json.loads(responsedata, parse_float=decimal.Decimal)
-        if "error" in response and response["error"] is None:
-            log.debug("<-%s- %s"%(response["id"], json.dumps(response["result"], default=EncodeDecimal)))
+        if "error" in json_response and json_response["error"] is None:
+            log.debug("<-%s- %s"%(json_response["id"], json.dumps(json_response["result"], default=EncodeDecimal)))
         else:
-            log.debug("<-- "+responsedata)
-        return response
+            log.debug("<-- "+str(resp))
+        return json_response
