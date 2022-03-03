@@ -35,7 +35,7 @@
 """
 
 import aiohttp
-from asyncio import wait_for
+from asyncio import TimeoutError, wait_for
 import base64
 import decimal
 import json
@@ -130,30 +130,15 @@ class AuthServiceProxy(object):
                                'method': self.__service_name,
                                'params': args,
                                'id': AuthServiceProxy.__id_count}, default=EncodeDecimal)
-        request_headers = {"Host": self.__url.hostname,
-                           "User-Agent": USER_AGENT,
-                           "Content-type": "application/json"}
-        resp = await wait_for(self._get_shared_client().request(method="POST",
-                                                                url=self.__url.geturl(),
-                                                                data=postdata,
-                                                                headers=request_headers), self.__timeout)
+        resp = await wait_for(self._call_rpc(postdata), self.__timeout)
 
         response = await self._get_response(resp)
-        if self.__aiohttp_must_close:
-            await self._get_shared_client().close()
         if response.get('error') is not None:
             raise JSONRPCException(response['error'])
         elif 'result' not in response:
-            raise JSONRPCException({
-                'code': -343, 'message': 'missing JSON-RPC result'})
+            self._raise_general_error()
         
         return response['result']
-
-    def _get_shared_client(self) -> aiohttp.ClientSession:
-        if not self.__aiohttp_client_session:
-            self.__aiohttp_client_session = aiohttp.ClientSession()
-            self.__aiohttp_must_close = True
-        return self.__aiohttp_client_session
 
     async def batch_(self, rpc_calls):
         """Batch RPC call.
@@ -168,14 +153,7 @@ class AuthServiceProxy(object):
 
         postdata = json.dumps(batch_data, default=EncodeDecimal)
         log.debug("--> "+postdata)
-        request_headers = {"Host": self.__url.hostname,
-                           "User-Agent": USER_AGENT,
-                           "Authorization": self.__auth_header,
-                           "Content-type": "application/json"}
-        resp = await self._get_shared_client().request(method="POST",
-                                                       url=self.__url.geturl(),
-                                                       data=postdata,
-                                                       headers=request_headers)
+        resp = await self._call_rpc(postdata)
         results = []
         responses = await self._get_response(resp)
         if isinstance(responses, (dict,)):
@@ -187,11 +165,37 @@ class AuthServiceProxy(object):
             if response['error'] is not None:
                 raise JSONRPCException(response['error'])
             elif 'result' not in response:
-                raise JSONRPCException({
-                    'code': -343, 'message': 'missing JSON-RPC result'})
+                self._raise_general_error()
             else:
                 results.append(response['result'])
         return results
+
+    def _get_shared_client(self) -> aiohttp.ClientSession:
+        if not self.__aiohttp_client_session:
+            self.__aiohttp_client_session = aiohttp.ClientSession()
+            self.__aiohttp_must_close = True
+        return self.__aiohttp_client_session
+
+    def _raise_general_error(self):
+        raise JSONRPCException({
+            'code': -343, 'message': 'missing JSON-RPC result'})
+
+    async def _call_rpc(self, postdata):
+        request_headers = {
+            "Host": self.__url.hostname,
+            "User-Agent": USER_AGENT,
+            "Content-type": "application/json",
+        }
+        try:
+            client = self._get_shared_client()
+            return await client.request(method="POST",
+                                        url=self.__url.geturl(),
+                                        data=postdata,
+                                        headers=request_headers)
+        except Exception:
+            if self.__aiohttp_must_close:
+                await self._get_shared_client().close()
+            raise
 
     async def _get_response(self, resp):
         try:
